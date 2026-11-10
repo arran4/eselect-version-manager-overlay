@@ -1,0 +1,62 @@
+name: Validate Portage overlay
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  overlay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out overlay
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Validate production versus fixture boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(cat profiles/repo_name)" = 'eselect-version-manager-overlay'
+          test "$(cat tests/portage-overlay/profiles/repo_name)" = 'eselect-version-manager-fixtures'
+          test -f app-eselect/eselect-version-manager/eselect-version-manager-0.1.0.ebuild
+          test -f tests/portage-overlay/dev-lang/go/go-1.22.4.ebuild
+          test -f tests/portage-overlay/dev-lang/go/go-1.23.1.ebuild
+          test ! -d dev-lang/go
+          test ! -d net-libs/nodejs
+          if grep -R --include='*.ebuild' -l 'Mocked Go toolchain package' app-eselect; then
+            echo 'Mock toolchain ebuild found in production overlay' >&2
+            exit 1
+          fi
+          bash -n tests/portage-overlay/app-misc/version-manager-fixture/*.ebuild
+          bash -n tests/portage-overlay/app-misc/unslotted-fixture/*.ebuild
+          bash -n tests/portage-overlay/dev-lang/go/*.ebuild
+          bash -n app-eselect/eselect-version-manager/*.ebuild
+      - name: Set up Go for G2
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.0'
+      - name: Install G2 (reviewed release)
+        run: go install github.com/arran4/g2/cmd/g2@v0.0.107
+      - name: G2 repository lint
+        run: |
+          set -euo pipefail
+          # The standalone Ubuntu job does not have a populated Gentoo master
+          # repository, so LicenseExists cannot resolve Gentoo's own licenses.
+          # This check remains Portage's responsibility in Gentoo container E2E;
+          # do not suppress any other license checks.
+          # Only the two missing-Manifest rules are exempt for unpublished v0.1.0.
+          if [ -f app-eselect/eselect-version-manager/Manifest ]; then
+            "$(go env GOPATH)/bin/g2" lint repo -format github-actions -fail-severity error -disable-rule LicenseExists .
+            "$(go env GOPATH)/bin/g2" manifest verify .
+          else
+            echo "::warning::Manifest absent for unpublished v0.1.0; only missing-Manifest rules are temporarily exempt"
+            "$(go env GOPATH)/bin/g2" lint repo -format github-actions -fail-severity error -disable-rule MissingManifest,ManifestChecks,LicenseExists .
+          fi
