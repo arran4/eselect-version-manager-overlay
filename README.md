@@ -43,6 +43,16 @@ g2 manifest verify .
 
 The latter two commands require actual release Manifests; CI uses an explicitly documented temporary exception until they exist. G2 is a static inspector and website generator, not a substitute for Portage's real `emerge` and `ebuild manifest` checks.
 
+## Published source-release updates
+
+The [release-update workflow](.github/workflows/overlay-updates.yml) checks for new, **published stable releases** of [eselect-version-manager](https://github.com/arran4/eselect-version-manager). It runs daily and supports a manual `tag` input to prepare a specific released version.
+
+For each new version it copies the reviewed stable ebuild template, generates a **real** `Manifest` from the tagged GitHub source archive in a Gentoo Portage container, builds and installs the package, verifies and unmerges it, runs `g2 manifest verify`, and opens a version-specific PR. The workflow does **not** merge the PR or publish a release.
+
+It uses only the repository's `GITHUB_TOKEN`; no cross-repository write token is needed because discovery reads public GitHub Releases. In **Settings → Actions → General**, enable **Allow GitHub Actions to create and approve pull requests** so that the update workflow can open its PR. If disabled, the workflow's push/PR creation step will fail rather than claim completion. Reviews and normal overlay validation remain required.
+
+When source publishes `v0.1.0`, the workflow can create the actual `0.1.0` Manifest; no `9999` ebuild is required to bootstrap the release. A future live ebuild would be for opt-in source checkouts, not normal release distribution.
+
 ## Verified toolchains versus fixtures
 
 The fixture Go packages return canned strings. Genuine co-installable Go and Node.js packages require separately validated ebuilds ([Go #2](https://github.com/arran4/eselect-version-manager-overlay/issues/2), [Node #3](https://github.com/arran4/eselect-version-manager-overlay/issues/3)). Gentoo already slots Python and Maven; prefer those existing packages and selectors.
