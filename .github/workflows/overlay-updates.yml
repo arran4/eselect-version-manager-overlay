@@ -1,0 +1,167 @@
+name: Update ebuild from published version-manager releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable source release tag (leave blank for latest)
+        required: false
+        type: string
+  schedule:
+    - cron: '0 7 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-release-update
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Discover published stable source release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Select a genuinely published release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          releases="$(gh api 'repos/arran4/eselect-version-manager/releases?per_page=100' \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')"
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            tag="$REQUESTED_TAG"
+          else
+            tag="$(printf '%s\n' "$releases" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          fi
+          if [[ -z "$tag" ]]; then
+            echo 'No published stable source release yet; overlay has nothing to update.'
+            exit 0
+          fi
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "Unsupported Gentoo stable release tag: $tag" >&2
+            exit 2
+          }
+          grep -Fxq -- "$tag" <<< "$releases" || {
+            echo "Refusing unpublished or prerelease tag: $tag" >&2
+            exit 1
+          }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  update:
+    name: Generate, install-test and propose release ebuild
+    needs: [detect]
+    if: ${{ needs.detect.outputs.version != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+      VM_VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - name: Checkout companion Portage overlay
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Avoid duplicate update PRs
+        id: pending
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="automation/eselect-version-manager-$VM_VERSION"
+          if [[ -n "$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')" ]]; then
+            echo "Matching release update PR already open: $branch"
+            echo "already_open=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prepare versioned ebuild from reviewed template
+        if: ${{ steps.pending.outputs.already_open != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=app-eselect/eselect-version-manager
+          file="$dir/eselect-version-manager-$VM_VERSION.ebuild"
+          if [[ ! -f "$file" ]]; then
+            test -f "$dir/eselect-version-manager-0.1.0.ebuild"
+            cp "$dir/eselect-version-manager-0.1.0.ebuild" "$file"
+          fi
+          bash -n "$file"
+      - name: Generate authoritative Manifest and install using Gentoo Portage
+        if: ${{ steps.pending.outputs.already_open != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker create --name evm-portage-tree gentoo/portage@sha256:84e5a31feb6302cde18f904d16c877eccbbdc3943853d22965145ae8154491a9
+          docker cp evm-portage-tree:/var/db/repos/gentoo "$RUNNER_TEMP/gentoo"
+          docker rm evm-portage-tree
+          docker run --rm \
+            -e VM_VERSION="$VM_VERSION" \
+            -v "$GITHUB_WORKSPACE:/overlay" \
+            -v "$RUNNER_TEMP/gentoo:/var/db/repos/gentoo:ro" \
+            gentoo/stage3@sha256:74bd9b8e57bdf72d88ccacc4c467b8e73af584b06c3e89b581db8d35930416d3 \
+            bash -euo pipefail -c '
+              mkdir -p /etc/portage/repos.conf /etc/portage/package.accept_keywords
+              printf "[eselect-version-manager-overlay]\nlocation = /overlay\npriority = 100\nauto-sync = false\n" \
+                > /etc/portage/repos.conf/eselect-version-manager.conf
+              printf "app-eselect/eselect-version-manager ~amd64\n" \
+                > /etc/portage/package.accept_keywords/eselect-version-manager
+              if [[ ! -e /etc/portage/make.profile ]]; then
+                ln -s /var/db/repos/gentoo/profiles/default/linux/amd64/23.0 /etc/portage/make.profile
+              fi
+              printf "FEATURES=\"-ipc-sandbox -network-sandbox -pid-sandbox\"\n" >> /etc/portage/make.conf
+              ebuild --force "/overlay/app-eselect/eselect-version-manager/eselect-version-manager-${VM_VERSION}.ebuild" manifest
+              emerge --quiet-build=y --oneshot "=app-eselect/eselect-version-manager-${VM_VERSION}"
+              test -x /usr/libexec/eselect-version-manager/dispatcher
+              eselect version-manager help >/dev/null
+              test -d "/var/db/pkg/app-eselect/eselect-version-manager-${VM_VERSION}"
+              emerge --unmerge --quiet app-eselect/eselect-version-manager
+              test ! -f /usr/share/eselect/modules/version-manager.eselect
+            '
+      - name: Set up Go for G2 verification
+        if: ${{ steps.pending.outputs.already_open != 'true' }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.0'
+          cache: false
+      - name: Validate generated Manifest with G2
+        if: ${{ steps.pending.outputs.already_open != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app-eselect/eselect-version-manager/Manifest
+          # G2 is available as a tagged Go tool, not required by end users.
+          go install github.com/arran4/g2/cmd/g2@v0.0.107
+          "$(go env GOPATH)/bin/g2" manifest verify .
+      - name: Open a reviewable overlay release update PR
+        if: ${{ steps.pending.outputs.already_open != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=app-eselect/eselect-version-manager
+          git add "$dir/eselect-version-manager-$VM_VERSION.ebuild" "$dir/Manifest"
+          if git diff --cached --quiet; then
+            echo "Overlay already contains matching ebuild/Manifest for $RELEASE_TAG."
+            exit 0
+          fi
+          branch="automation/eselect-version-manager-$VM_VERSION"
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
+            echo "Branch $branch already exists. Review it before rerunning; no force-push." >&2
+            exit 1
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "app-eselect/eselect-version-manager: update to $VM_VERSION"
+          git switch -c "$branch"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "app-eselect/eselect-version-manager: $VM_VERSION release and Manifest" \
+            --body "Prepared from the published [$RELEASE_TAG](https://github.com/arran4/eselect-version-manager/releases/tag/$RELEASE_TAG) source archive. Generated the real Portage Manifest and passed a Gentoo emerge/install/unmerge smoke test plus G2 Manifest verification. Please review and merge; no CI-only mock Go packages were promoted. Source release and GHCR publication remain independent of this overlay PR."
