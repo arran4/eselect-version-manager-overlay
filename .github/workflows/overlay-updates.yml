@@ -154,7 +154,10 @@ jobs:
           fi
           branch="automation/eselect-version-manager-$VM_VERSION"
           if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
-            echo "Branch $branch already exists. Review it before rerunning; no force-push." >&2
+            manual_url="https://github.com/${GITHUB_REPOSITORY}/pull/new/${branch}"
+            echo "::error::Release branch $branch already exists without an open PR; refusing to overwrite generated files."
+            echo "::notice title=Open existing release PR::$manual_url"
+            printf '## Existing release branch\\n\\nOpen the generated PR manually: %s\\n' "$manual_url" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           git -c user.name='github-actions[bot]' \
@@ -162,6 +165,12 @@ jobs:
               commit -m "app-eselect/eselect-version-manager: update to $VM_VERSION"
           git switch -c "$branch"
           git push origin "$branch"
-          gh pr create --base main --head "$branch" \
+          if ! gh pr create --base main --head "$branch" \
             --title "app-eselect/eselect-version-manager: $VM_VERSION release and Manifest" \
-            --body "Prepared from the published [$RELEASE_TAG](https://github.com/arran4/eselect-version-manager/releases/tag/$RELEASE_TAG) source archive. Generated the real Portage Manifest and passed a Gentoo emerge/install/unmerge smoke test plus G2 Manifest verification. Please review and merge; no CI-only mock Go packages were promoted. Source release and GHCR publication remain independent of this overlay PR."
+            --body "Prepared from the published [$RELEASE_TAG](https://github.com/arran4/eselect-version-manager/releases/tag/$RELEASE_TAG) source archive. Generated the real Portage Manifest and passed a Gentoo emerge/install/unmerge smoke test plus G2 Manifest verification. Please review and merge; no CI-only mock Go packages were promoted. Source release and GHCR publication remain independent of this overlay PR."; then
+            manual_url="https://github.com/${GITHUB_REPOSITORY}/pull/new/${branch}"
+            echo "::error::Generated and tested release files were pushed, but GitHub rejected PR creation. Enable 'Allow GitHub Actions to create and approve pull requests' under Settings > Actions > General, or open the PR manually."
+            echo "::notice title=Open generated release PR::$manual_url"
+            printf '## Release artifacts generated; PR still required\\n\\nThe versioned ebuild and Manifest were verified and pushed to `%s`, but GitHub Actions could not open the PR.\\n\\n[Open a review PR manually](%s) or enable PR creation in repository Actions settings.\\n' "$branch" "$manual_url" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
