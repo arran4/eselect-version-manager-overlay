@@ -32,6 +32,13 @@ BDEPEND="
 
 S="${WORKDIR}/${P}"
 
+# The upstream release archive contains a Makefile whose default target runs
+# pytest. These Python scripts need no compile step; upstream CI executes the
+# tests separately, while the Portage install path is verified in Gentoo E2E.
+src_compile() {
+	:
+}
+
 src_install() {
 	# Install eselect module
 	insinto /usr/share/eselect/modules
