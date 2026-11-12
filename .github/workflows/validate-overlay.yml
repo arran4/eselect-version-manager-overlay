@@ -67,34 +67,63 @@ jobs:
           fi
 
   tagged-archive-install:
-    name: Install real tagged v0.1.0 archive via Portage
+    name: Install newest released ebuild from matching tagged archive
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Check out immutable v0.1.0 upstream source
+      - name: Check out candidate overlay changes
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: arran4/eselect-version-manager
-          ref: v0.1.0
-          path: source
+          path: candidate-overlay
 
-      - name: Check out proposed overlay package changes
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          path: source/overlay
-
-      - name: Verify archive and ebuild inputs
+      - name: Determine newest stable versioned package
+        id: package
         shell: bash
         run: |
           set -euo pipefail
+          package_dir=candidate-overlay/app-eselect/eselect-version-manager
+          version="$(find "$package_dir" -maxdepth 1 -type f \
+            -name 'eselect-version-manager-[0-9]*.ebuild' -printf '%f\n' |
+            sed -nE 's/^eselect-version-manager-([0-9]+\.[0-9]+\.[0-9]+)\.ebuild$/\1/p' |
+            sort -V | tail -n 1)"
+          test -n "$version" || {
+            echo 'No stable versioned eselect-version-manager ebuild found' >&2
+            exit 1
+          }
+          test -f "$package_dir/eselect-version-manager-$version.ebuild"
+          echo "Selected matching immutable source tag: v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check out corresponding upstream source tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: arran4/eselect-version-manager
+          ref: v${{ steps.package.outputs.version }}
+          path: source
+
+      - name: Copy candidate overlay into upstream Docker context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source/overlay
+          cp -a candidate-overlay/. source/overlay/
+          rm -rf source/overlay/.git
+
+      - name: Verify matching source and ebuild inputs
+        shell: bash
+        env:
+          VM_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
           test -f source/Makefile
-          test -f source/overlay/app-eselect/eselect-version-manager/eselect-version-manager-0.1.0.ebuild
-          grep -q '^src_compile()' source/overlay/app-eselect/eselect-version-manager/eselect-version-manager-0.1.0.ebuild
+          file="source/overlay/app-eselect/eselect-version-manager/eselect-version-manager-$VM_VERSION.ebuild"
+          test -f "$file"
+          grep -q '^src_compile()' "$file"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
-      - name: Reproduce installation from the real tagged archive
+      - name: Install and integration-test the matching tagged release
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: ./source
@@ -103,7 +132,7 @@ jobs:
           platforms: linux/amd64
           push: false
           build-args: |
-            VM_VERSION=0.1.0
+            VM_VERSION=${{ steps.package.outputs.version }}
             VM_SOURCE=release
           cache-from: type=gha,scope=eselect-gentoo-e2e
-          cache-to: type=gha,scope=eselect-release-ebuild-fix,mode=max,ignore-error=true
+          cache-to: type=gha,scope=eselect-overlay-tagged-e2e,mode=max,ignore-error=true
